@@ -40,7 +40,9 @@ sudo sh -c 'modprobe -r spidev && modprobe spidev'
 echo "spidev bufsiz now: $(cat /sys/module/spidev/parameters/bufsiz) (expected 32768)"
 cat <<EOF
 
-Done. Old prints are NBIS-format and will not load; enroll again (press, don't swipe):
+Done. Old prints are NBIS-format and will not load; enroll again.
+Press, don't swipe: presses 1-8 on the centre, 9-15 on the edges (tip, base, left, right),
+each edge press still overlapping some centre.
   fprintd-delete \$USER
   fprintd-enroll -f right-index-finger
 Then test with scripts/test-verify.sh, and optionally: sudo pam-auth-update --enable fprintd

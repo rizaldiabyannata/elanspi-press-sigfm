@@ -41,10 +41,26 @@ Typical symptoms:
 | Stock libfprint 1.95.1 (NBIS, swipe) | 0/5 | – |
 | SIGFM + press, 7 stages, single frame | 4/6 | 0/4 |
 | SIGFM + press, 15 stages, single frame | 1/6 | 0/4 |
-| **SIGFM + press, 15 stages, 3-frame average, threshold 15** | **5/6** | **0/4** |
+| SIGFM + press, 15 stages, 3-frame average, threshold 15 | 5/6 | 0/4 |
+| **same + two-phase enroll (centre, then edges)** | **3/3 normal, 5/6 deliberately misplaced** | **0/4** |
 
-Different fingers scored 0 in every comparison. ~30 attempts is not a security evaluation:
+Different fingers scored 0 in every comparison. ~50 attempts is not a security evaluation:
 treat the fingerprint as a convenience and keep your password.
+
+## How to enroll
+
+The sensor sees only an ~80×80 patch of the finger, so a verify press can only match a part of the
+finger that was recorded at enroll. Cover the finger like Windows Hello's two-phase enroll does:
+
+- presses **1–8: centre** of the fingertip, shifting slightly each time;
+- presses **9–15: edges** — tip, base, left, right, diagonals — each still overlapping some centre.
+
+Press, hold ~0.5 s, lift. Each `enroll-stage-passed` line is one accepted press.
+
+Fusing the presses into one larger "map" template was tried and dropped: in two test rounds it never
+decided a match (every success came from an individual press), because presses either overlapped
+strongly (44–99 RANSAC inliers) or not at all (0–4), and the individual templates already cover the
+strong overlaps.
 
 ## Install
 
@@ -60,7 +76,7 @@ Keep your distro's `libfprint` and `fprintd` installed: its udev rule binds ELAN
 ```sh
 sh scripts/install.sh
 fprintd-delete $USER                      # old NBIS prints cannot be read by SIGFM
-fprintd-enroll -f right-index-finger      # PRESS, hold ~0.5 s, lift; shift slightly each time
+fprintd-enroll -f right-index-finger      # PRESS, don't swipe: 8x centre, 7x edges (see "How to enroll")
 sh scripts/test-verify.sh                 # counts accepted/rejected attempts
 sudo pam-auth-update --enable fprintd     # optional: sudo / login with fingerprint
 ```
@@ -119,6 +135,8 @@ Untuk laptop ASUS dengan sensor sidik jari ELAN SPI (`ELAN7001`, terdeteksi seba
 Ada tiga masalah: buffer `spidev` terlalu kecil (error `timed out waiting for image`), driver
 memperlakukan sensor **tekan** sebagai sensor **usap** (skor selalu 0), dan matcher NBIS tidak cocok
 untuk area kecil. Repo ini memperbaiki ketiganya: buffer 32 KB, mode tekan, dan matcher SIGFM.
-Hasil uji: jari terdaftar 5/6, jari lain 0/4. Pasang dengan `sh scripts/install.sh`, lalu enroll
-ulang dengan cara **menempel**, bukan mengusap. Jangan sentuh sensor sekitar 1 detik saat
-enroll/verify dimulai, karena saat itu sensor sedang kalibrasi.
+Hasil uji: tempelan normal 3/3, sengaja meleset 5/6, jari lain 0/4. Pasang dengan
+`sh scripts/install.sh`, lalu enroll ulang dengan cara **menempel**, bukan mengusap: 8 kali di tengah,
+lalu 7 kali di tepi (ujung, pangkal, kiri, kanan, serong), dan setiap tempelan tepi tetap menutupi
+sebagian tengah. Jangan sentuh sensor sekitar 1 detik saat enroll/verify dimulai, karena saat itu
+sensor sedang kalibrasi.
