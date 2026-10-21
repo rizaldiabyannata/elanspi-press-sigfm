@@ -1,0 +1,154 @@
+diff --git a/libfprint/drivers/elanspi.c b/libfprint/drivers/elanspi.c
+index 9338013..8d8e6d4 100644
+--- a/libfprint/drivers/elanspi.c
++++ b/libfprint/drivers/elanspi.c
+@@ -387,6 +387,12 @@ elanspi_determine_sensor (FpiDeviceElanSpi *self, GError **err)
+           self->sensor_otp = entry->is_otp_model;
+ 
+           fp_dbg ("<init/detect> found sensor ID %d => [%s] (%d x %d)", self->sensor_id, entry->name, self->sensor_width, self->sensor_height);
++          if (self->sensor_id == 0xe)
++            {
++              fpi_device_set_scan_type (FP_DEVICE (self), FP_SCAN_TYPE_PRESS);
++              /* 80x80 covers a small patch of the finger; more presses widen what verify can overlap with */
++              fpi_device_set_nr_enroll_stages (FP_DEVICE (self), 15);
++            }
+           break;
+         }
+     }
+@@ -1359,6 +1365,31 @@ elanspi_fp_frame_stitch_and_submit (FpiDeviceElanSpi *self)
+   g_slist_free_full (g_steal_pointer (&self->fp_frame_list), g_free);
+ }
+ 
++/* stitching near-identical frames from a press sensor destroys the image, so submit one frame as-is */
++static void
++elanspi_fp_frame_press_submit (FpiDeviceElanSpi *self)
++{
++  g_autoptr(FpImage) img = fp_image_new (self->frame_width, self->frame_height);
++  g_autoptr(FpImage) scaled = NULL;
++  /* list is prepended, so the head holds the newest, most settled frames; averaging them cuts sensor noise */
++  guint n = MIN (g_slist_length (self->fp_frame_list), ELANSPI_PRESS_AVG_FRAMES);
++
++  for (int px = 0; px < self->frame_width * self->frame_height; px++)
++    {
++      guint sum = 0;
++      GSList *l = self->fp_frame_list;
++      for (guint i = 0; i < n; i++, l = l->next)
++        sum += ((struct fpi_frame *) l->data)->data[px];
++      img->data[px] = sum / n;
++    }
++  scaled = fpi_image_resize (img, 2, 2);
++  scaled->flags |= FPI_IMAGE_COLORS_INVERTED;
++
++  fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), g_steal_pointer (&scaled));
++
++  g_slist_free_full (g_steal_pointer (&self->fp_frame_list), g_free);
++}
++
+ static gint64
+ elanspi_get_frame_diff_stddev_sq (FpiDeviceElanSpi *self, guint16 *frame1, guint16 *frame2)
+ {
+@@ -1407,7 +1438,9 @@ elanspi_fp_frame_handler (FpiSsm *ssm, FpiDeviceElanSpi *self)
+           else
+             {
+               fp_dbg ("<fp_frame> not enough frames, reporting short swipe");
+-              fpi_image_device_retry_scan (FP_IMAGE_DEVICE (self), FP_DEVICE_RETRY_TOO_SHORT);
++              /* a press sensor lifted too early is not a "short swipe" */
++              fpi_image_device_retry_scan (FP_IMAGE_DEVICE (self),
++                                           self->sensor_id == 0xe ? FP_DEVICE_RETRY_GENERAL : FP_DEVICE_RETRY_TOO_SHORT);
+             }
+           goto finish_capture;
+         }
+@@ -1441,7 +1474,7 @@ elanspi_fp_frame_handler (FpiSsm *ssm, FpiDeviceElanSpi *self)
+       elanspi_correct_with_bg (self, self->last_image);
+       elanspi_process_frame (self, self->last_image, this_frame->data);
+ 
+-      if (self->fp_frame_list)
++      if (self->fp_frame_list && self->sensor_id != 0xe)
+         {
+           gint difference = elanspi_get_frame_diff_stddev_sq (self, self->last_image, self->prev_frame_image);
+           fp_dbg ("<fp_frame> diff = %d", difference);
+@@ -1453,6 +1486,12 @@ elanspi_fp_frame_handler (FpiSsm *ssm, FpiDeviceElanSpi *self)
+         }
+       self->fp_frame_list = g_slist_prepend (self->fp_frame_list, g_steal_pointer (&this_frame));
+       memcpy (self->prev_frame_image, self->last_image, self->sensor_height * self->sensor_width * 2);
++      if (self->sensor_id == 0xe && g_slist_length (self->fp_frame_list) >= ELANSPI_PRESS_FRAMES)
++        {
++          fp_dbg ("<fp_frame> press sensor, submitting newest frame");
++          elanspi_fp_frame_press_submit (self);
++          goto finish_capture;
++        }
+       break;
+     }
+ 
+@@ -1572,6 +1611,9 @@ elanspi_open (FpImageDevice *dev)
+ 
+   self->spi_fd = spi_fd;
+ 
++  if (fpi_device_get_driver_data (FP_DEVICE (dev)) & ELANSPI_PRESS_SENSOR)
++    fpi_device_set_scan_type (FP_DEVICE (dev), FP_SCAN_TYPE_PRESS);
++
+   fpi_image_device_open_complete (dev, NULL);
+ }
+ 
+@@ -1701,7 +1743,9 @@ fpi_device_elanspi_class_init (FpiDeviceElanSpiClass *klass)
+   dev_class->scan_type = FP_SCAN_TYPE_SWIPE;
+   dev_class->nr_enroll_stages = 7;       /* these sensors are very hit or miss, may as well record a few extras */
+ 
+-  img_class->bz3_threshold = 24;
++  /* NBIS finds ~no minutiae on 80x80 frames; SIGFM keypoints do. On eFSA80SC impostors scored 0, genuine 17..4245 */
++  img_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
++  img_class->bz3_threshold = 15;
+   img_class->img_open = elanspi_open;
+   img_class->activate = elanspi_activate;
+   img_class->deactivate = elanspi_deactivate;
+diff --git a/libfprint/drivers/elanspi.h b/libfprint/drivers/elanspi.h
+index a8d7319..b08e308 100644
+--- a/libfprint/drivers/elanspi.h
++++ b/libfprint/drivers/elanspi.h
+@@ -334,6 +334,8 @@ static const struct elanspi_regtable elanspi_calibration_table_new_page1 = {
+ #define ELANSPI_90RIGHT_ROTATE 3
+ 
+ #define ELANSPI_HV_FLIPPED 1
++/* known press (area) sensor: report press scan type at open, before clients show "swipe" prompts */
++#define ELANSPI_PRESS_SENSOR (1 << 4)
+ 
+ #define ELANSPI_UDEV_TYPES FPI_DEVICE_UDEV_SUBTYPE_SPIDEV | FPI_DEVICE_UDEV_SUBTYPE_HIDRAW
+ #define ELANSPI_TP_VID 0x04f3
+@@ -349,6 +351,7 @@ static const FpIdEntry elanspi_id_table[] = {
+   {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN70A1", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x30b2}, .driver_data = ELANSPI_NO_ROTATE},
+   {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x309f}, .driver_data = ELANSPI_180_ROTATE},
+   {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x241f}, .driver_data = ELANSPI_NO_ROTATE},
++  {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3128}, .driver_data = ELANSPI_NO_ROTATE | ELANSPI_PRESS_SENSOR},
+   {.udev_types = 0}
+ };
+ 
+@@ -371,6 +374,10 @@ static const FpIdEntry elanspi_id_table[] = {
+ #define ELANSPI_MIN_FRAMES_SWIPE (7 + ELANSPI_SWIPE_FRAMES_DISCARD)
+ #define ELANSPI_MAX_FRAMES_SWIPE (20 + ELANSPI_SWIPE_FRAMES_DISCARD)
+ 
++/* eFSA80SC (0xe) is a press sensor; finger frames to wait for before submitting the newest one */
++#define ELANSPI_PRESS_FRAMES 6
++#define ELANSPI_PRESS_AVG_FRAMES 3
++
+ #define ELANSPI_MAX_FRAME_HEIGHT 43
+ #define ELANSPI_MIN_FRAME_TO_FRAME_DIFF (250 * 250)
+ 
+diff --git a/libfprint/sigfm/meson.build b/libfprint/sigfm/meson.build
+index b04154d..051872b 100644
+--- a/libfprint/sigfm/meson.build
++++ b/libfprint/sigfm/meson.build
+@@ -2,10 +2,12 @@
+ sigfm_sources = ['sigfm.cpp']
+ 
+ opencv = dependency('opencv4', required: true, version: '>=4.5.0')
+-doctest = dependency('doctest', required: true, version: ['>=2.0.0', '<3.0.0'])
++doctest = dependency('doctest', required: false, version: ['>=2.0.0', '<3.0.0'])
+ 
+ libsigfm = static_library('sigfm',
+         sigfm_sources,
+         dependencies: [opencv],
+ )
+-sigfm_tests = executable('sigfm-tests', ['./tests.cpp'], dependencies: [doctest, opencv], link_with: [libsigfm])
++if doctest.found()
++  sigfm_tests = executable('sigfm-tests', ['./tests.cpp'], dependencies: [doctest, opencv], link_with: [libsigfm])
++endif
